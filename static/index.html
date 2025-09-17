@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI K8s Chat</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
+        #chat-history { flex-grow: 1; overflow-y: auto; padding: 10px; }
+        .message { margin-bottom: 10px; }
+        .user { text-align: right; }
+        .bot { background-color: #f1f1f1; padding: 10px; border-radius: 5px; }
+        #chat-input { display: flex; padding: 10px; border-top: 1px solid #ccc; }
+        #chat-input input { flex-grow: 1; border: 1px solid #ccc; border-radius: 5px; padding: 10px; }
+        #chat-input button { border: none; background-color: #007bff; color: white; padding: 10px 15px; border-radius: 5px; margin-left: 10px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div id="chat-history"></div>
+    <div id="chat-input">
+        <input type="text" id="message-input" placeholder="Ask about your Kubernetes cluster...">
+        <button id="send-button">Send</button>
+    </div>
+    <script>
+        const chatHistory = document.getElementById('chat-history');
+        const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+
+        sendButton.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keyup', (event) => {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        async function sendMessage() {
+            const message = messageInput.value;
+            if (!message) return;
+
+            appendMessage('user', message);
+            messageInput.value = '';
+
+            const response = await fetch('/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: message })
+            });
+
+            const data = await response.json();
+            appendMessage('bot', data.reply);
+        }
+
+        function appendMessage(sender, message) {
+            const messageElement = document.createElement('div');
+            messageElement.classList.add('message', sender);
+            messageElement.innerHTML = message; // Using innerHTML to render markdown
+            chatHistory.appendChild(messageElement);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+    </script>
+</body>
+</html>

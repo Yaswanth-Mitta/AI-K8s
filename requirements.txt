@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+boto3
+langgraph
+langchain-aws
+kubernetes
+anthropic
+langchain
+cachetools # Added for session timeout
+python-dotenv # Added for .env support

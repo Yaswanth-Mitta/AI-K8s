@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-k8s-chat-deployment
+  namespace: default
+  labels:
+    app: ai-k8s-chat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-k8s-chat
+  template:
+    metadata:
+      labels:
+        app: ai-k8s-chat
+    spec:
+      serviceAccountName: ai-k8s-chat-sa
+      containers:
+      - name: ai-k8s-chat
+        image: YOUR_DOCKER_USERNAME/ai-k8s-chat:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AWS_REGION
+          value: "us-east-1"
+        # It is recommended to use a more secure method for credentials,
+        # such as IRSA (IAM Roles for Service Accounts) on EKS.
+        # For other environments, you can use a secret:
+        # - name: AWS_ACCESS_KEY_ID
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: bedrock-credentials
+        #       key: aws_access_key_id
+        # - name: AWS_SECRET_ACCESS_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: bedrock-credentials
+        #       key: aws_secret_access_key
