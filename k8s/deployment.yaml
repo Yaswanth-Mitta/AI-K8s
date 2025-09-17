@@ -24,16 +24,13 @@ spec:
         env:
         - name: AWS_REGION
           value: "us-east-1"
-        # It is recommended to use a more secure method for credentials,
-        # such as IRSA (IAM Roles for Service Accounts) on EKS.
-        # For other environments, you can use a secret:
-        # - name: AWS_ACCESS_KEY_ID
-        #   valueFrom:
-        #     secretKeyRef:
-        #       name: bedrock-credentials
-        #       key: aws_access_key_id
-        # - name: AWS_SECRET_ACCESS_KEY
-        #   valueFrom:
-        #     secretKeyRef:
-        #       name: bedrock-credentials
-        #       key: aws_secret_access_key
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: bedrock-credentials
+              key: aws_access_key_id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: bedrock-credentials
+              key: aws_secret_access_key
