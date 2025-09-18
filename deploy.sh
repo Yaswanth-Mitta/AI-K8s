@@ -27,7 +27,13 @@ if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
 fi
 echo "✅ Credentials found."
 
-# --- Step 3: Create/Update Kubernetes Secret ---
+# --- Step 3: Validate kubectl availability ---
+if ! command -v kubectl &> /dev/null; then
+    echo "❌ Error: kubectl is not installed or not in PATH"
+    exit 1
+fi
+
+# --- Step 4: Create/Update Kubernetes Secret ---
 echo "🔐 Creating/updating Kubernetes secret 'bedrock-credentials'..."
 
 # This command is idempotent. It creates the secret if it doesn't exist, and updates it if it does.
@@ -38,7 +44,13 @@ kubectl create secret generic bedrock-credentials \
 
 echo "✅ Secret 'bedrock-credentials' is up to date."
 
-# --- Step 4: Apply all Kubernetes manifests ---
+# --- Step 5: Validate k8s directory ---
+if [ ! -d "k8s" ]; then
+    echo "❌ Error: k8s directory not found"
+    exit 1
+fi
+
+# --- Step 6: Apply all Kubernetes manifests ---
 echo "Applying all Kubernetes manifests from the 'k8s' directory..."
 
 kubectl apply -f k8s/ || { echo "Failed to apply Kubernetes manifests"; exit 1; }

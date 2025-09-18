@@ -27,6 +27,12 @@ if [ ! -f ".env" ]; then
     echo "Warning: .env file not found. Please create one from .env.example template."
 fi
 
+# Check for requirements.txt
+if [ ! -f "requirements.txt" ]; then
+    echo "Error: requirements.txt file not found"
+    exit 1
+fi
+
 echo "Installing/updating dependencies from requirements.txt..."
 pip install -r requirements.txt || { echo "Failed to install dependencies"; exit 1; }
 

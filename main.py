@@ -192,7 +192,8 @@ def k8s_executor(state: GraphState):
             for i in services.items:
                 ports = ",".join([f'{p.port}:{p.node_port}/{p.protocol}' for p in i.spec.ports]) if i.spec.type == "NodePort" else ",".join([f'{p.port}/{p.protocol}' for p in i.spec.ports])
                 age = get_relative_age(i.metadata.creation_timestamp)
-                service_list.append(f'{i.metadata.name},{i.spec.cluster_ip},{i.spec.external_i_ps if i.spec.external_i_ps else '<none>'},{ports},{age}')
+                external_ips = i.spec.external_i_ps if i.spec.external_i_ps else 'none'
+                service_list.append(f'{i.metadata.name},{i.spec.cluster_ip},{external_ips},{ports},{age}')
             result["raw"] = "NAME,TYPE,CLUSTER-IP,EXTERNAL-IP,PORT(S),AGE\n" + "\n".join(service_list)
 
         elif action == "get_logs":

@@ -11,4 +11,4 @@ spec:
     - protocol: TCP
       port: 8080
       targetPort: 8080
-      # nodePort: 30080 # Optionally specify a port
+      # nodePort: 30080 # Uncomment to specify a fixed port for external access
