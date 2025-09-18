@@ -12,8 +12,10 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-# Export variables from .env file for use in this script
-export $(grep -v '^#' .env | xargs)
+# Source the .env file in a way that handles special characters safely.
+set -a
+source .env
+set +a
 
 echo "✅ .env file loaded."
 
@@ -26,7 +28,7 @@ fi
 echo "✅ Credentials found."
 
 # --- Step 3: Create/Update Kubernetes Secret ---
-echo "🔐 Creating/updating Kubernetes secret 'bedrock-credentials' நான...
+echo "🔐 Creating/updating Kubernetes secret 'bedrock-credentials' நான..."
 
 # This command is idempotent. It creates the secret if it doesn't exist, and updates it if it does.
 kubectl create secret generic bedrock-credentials \
@@ -39,7 +41,6 @@ echo "✅ Secret 'bedrock-credentials' is up to date."
 # --- Step 4: Apply all Kubernetes manifests ---
 echo "Applying all Kubernetes manifests from the 'k8s' directory..."
 
-# The -k flag for kustomize is also a good option here, but -f is more direct for this project structure.
 kubectl apply -f k8s/
 
 echo "✅ All manifests applied."
