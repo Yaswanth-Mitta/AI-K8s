@@ -87,14 +87,14 @@ def nlu_agent(state: GraphState):
                 {chat_history}
                 
                 --- EXAMPLES ---
-                User: "show me pods" -> { "action": "get_pods" }
-                User: "scale frontend to 3 replicas" -> { "action": "scale", "resource": "deployment", "name": "frontend", "replicas": 3 }
-                User: "get logs for backend-abc" -> { "action": "get_logs", "pod": "backend-abc" }
+                User: "show me pods" -> {{ "action": "get_pods" }}
+                User: "scale frontend to 3 replicas" -> {{ "action": "scale", "resource": "deployment", "name": "frontend", "replicas": 3 }}
+                User: "get logs for backend-abc" -> {{ "action": "get_logs", "pod": "backend-abc" }}
                 
                 --- CONTEXTUAL EXAMPLES ---
                 (History shows a pod named 'backend-xyz-123' is in CrashLoopBackOff)
-                User: "why is that one failing?" -> { "action": "diagnose_pod", "pod": "backend-xyz-123" }
-                User: "get logs for that pod" -> { "action": "get_logs", "pod": "backend-xyz-123" }
+                User: "why is that one failing?" -> {{ "action": "diagnose_pod", "pod": "backend-xyz-123" }}
+                User: "get logs for that pod" -> {{ "action": "get_logs", "pod": "backend-xyz-123" }}
                 '''
             ),
             ("human", "{user_message}"),

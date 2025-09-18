@@ -18,7 +18,7 @@ spec:
       serviceAccountName: ai-k8s-chat-sa
       containers:
       - name: ai-k8s-chat
-        image: YOUR_DOCKER_USERNAME/ai-k8s-chat:latest
+        image: yaswanthmitta/ai-k8s-chat:latest
         ports:
         - containerPort: 8080
         env:
