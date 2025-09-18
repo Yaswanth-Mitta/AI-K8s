@@ -37,6 +37,14 @@
             color: white;
             align-self: flex-start;
         }
+        .command-info {
+            background-color: #1a1d23;
+            border-left: 4px solid #0d6efd;
+            padding: 0.5rem;
+            margin: 0.5rem 0;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
         .bot-message table {
             width: 100%;
             margin-top: 1rem;
@@ -121,14 +129,21 @@
             }
         });
 
-        function appendMessage(sender, messageContent) {
+        function appendMessage(sender, messageContent, commandInfo = null) {
             const messageWrapper = document.createElement('div');
             messageWrapper.classList.add('message', sender === 'user' ? 'user-message' : 'bot-message');
             
             if (sender === 'bot') {
                 // Use marked.js to render markdown from the bot
-                // This will correctly render tables, code blocks, etc.
                 messageWrapper.innerHTML = marked.parse(messageContent);
+                
+                // Add command info if available
+                if (commandInfo && commandInfo.command) {
+                    const commandDiv = document.createElement('div');
+                    commandDiv.classList.add('command-info');
+                    commandDiv.innerHTML = `<strong>Executed:</strong> <code>${commandInfo.command}</code>`;
+                    messageWrapper.appendChild(commandDiv);
+                }
             } else {
                 messageWrapper.textContent = messageContent;
             }
@@ -176,7 +191,10 @@
                     sessionId = data.session_id;
                     localStorage.setItem('sessionId', sessionId);
                 }
-                appendMessage('bot', data.reply);
+                appendMessage('bot', data.reply, {
+                    command: data.command,
+                    raw_output: data.raw_output
+                });
 
             } catch (error) {
                 console.error('Error sending message:', error);

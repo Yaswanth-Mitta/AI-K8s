@@ -9,3 +9,4 @@ langchain
 cachetools
 python-dotenv
 pydantic[email]
+PyYAML

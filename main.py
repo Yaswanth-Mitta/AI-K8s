@@ -4,6 +4,8 @@ import logging
 import html
 import uuid
 import re
+import subprocess
+import yaml
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Session cache with a 5-minute (300 seconds) TTL
 session_cache = TTLCache(maxsize=1024, ttl=300)
+
+# Cluster context cache
+cluster_context_cache = {}
 
 # --- Helper Functions ---
 def get_relative_age(timestamp):
@@ -81,268 +86,221 @@ except (NoCredentialsError, PartialCredentialsError) as e:
 app = FastAPI()
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=1000, description="User message")
+    message: str = Field(..., min_length=1, max_length=2000, description="User message")
 
 # --- LangGraph State (with Memory) ---
 class GraphState(TypedDict):
     user_message: str
     chat_history: List[BaseMessage]
-    intent: dict
-    k8s_result: dict # Can now hold structured data (logs, events)
+    cluster_context: str
+    kubectl_command: str
+    command_output: str
     final_response: str
 
 # --- LangGraph Nodes (Updated for Conversational Context) ---
 
-def nlu_agent(state: GraphState):
-    """Converts natural language to JSON intent, using conversation history for context."""
-    logger.info("Executing NLU Agent")
-    
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                '''You are an expert at converting natural language to a JSON intent for a Kubernetes chat bot.
-                Use the conversation history to understand context and resolve references.
-                Your output must be a single, valid JSON object.
-                Valid actions are: "get_pods", "get_services", "get_logs", "scale", "diagnose_pod", "get_pod_details".
-
-                --- CONVERSATION HISTORY ---
-                {chat_history}
-                
-                --- EXAMPLES ---
-                User: "show me pods" -> {{ "action": "get_pods" }}
-                User: "list all services" -> {{ "action": "get_services" }}
-                User: "scale frontend to 3 replicas" -> {{ "action": "scale", "resource": "deployment", "name": "frontend", "replicas": 3 }}
-                User: "get logs for backend-abc" -> {{ "action": "get_logs", "pod": "backend-abc" }}
-                User: "describe pod backend-abc" -> {{ "action": "get_pod_details", "pod": "backend-abc" }}
-                User: "describe ai-k8s pod" -> {{ "action": "get_pod_details", "pod": "ai-k8s-chat-deployment" }}
-                
-                --- CONTEXTUAL EXAMPLES ---
-                (History shows a pod named 'backend-xyz-123' is in CrashLoopBackOff)
-                User: "why is that one failing?" -> {{ "action": "diagnose_pod", "pod": "backend-xyz-123" }}
-                User: "get logs for that pod" -> {{ "action": "get_logs", "pod": "backend-xyz-123" }}
-                User: "describe this pod ai-k8s-chat-deployment-544fc7d5b6-x2g8z" -> {{ "action": "get_pod_details", "pod": "ai-k8s-chat-deployment-544fc7d5b6-x2g8z" }}
-                '''
-            ),
-            ("human", "{user_message}"),
-        ]
-    )
-    if not llm:
-        raise RuntimeError("LLM is not initialized.")
-
-    chain = prompt | llm
-    response = chain.invoke({"user_message": state["user_message"], "chat_history": state["chat_history"]})
-    
+def get_cluster_context():
+    """Get comprehensive cluster context for the AI model."""
     try:
-        # Use regex for better JSON extraction
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response.content)
-        if json_match:
-            json_str = json_match.group()
-            intent = json.loads(json_str)
-            logger.info(f"NLU generated intent: {intent}")
-            return {"intent": intent}
-        else:
-            raise ValueError("No JSON found in response")
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Error decoding LLM response into JSON: {e}")
-        return {"intent": {"action": "error", "details": "I couldn't understand that request."}}
-
-def validator_agent(state: GraphState):
-    """Validates the intent from the NLU agent."""
-    logger.info("Executing Validator Agent")
-    intent = state.get("intent", {})
-    action = intent.get("action")
-    
-    if not action or action not in ["get_pods", "get_services", "get_logs", "scale", "diagnose_pod", "get_pod_details"]:
-        intent["action"] = "error"
-        intent["details"] = "Invalid action specified."
-    
-    # Validate required parameters
-    if action == "get_logs" and not intent.get("pod"):
-        intent["action"] = "error"
-        intent["details"] = "Pod name is required for getting logs."
-    elif action == "scale" and (not intent.get("name") or not intent.get("replicas")):
-        intent["action"] = "error"
-        intent["details"] = "Deployment name and replica count are required for scaling."
-    elif action in ["diagnose_pod", "get_pod_details"] and not intent.get("pod"):
-        intent["action"] = "error"
-        intent["details"] = "Pod name is required for this operation."
-    
-    return {"intent": intent}
-
-def k8s_executor(state: GraphState):
-    """Executes the validated Kubernetes action."""
-    logger.info("Executing K8s Executor")
-    intent = state["intent"]
-    action = intent["action"]
-    result = {}
-
-    try:
-        if action == "get_pods":
-            pods = k8s_core_v1.list_namespaced_pod(namespace="default", watch=False)
-            pod_list = []
-            for i in pods.items:
-                ready_containers = sum([1 for c in i.status.container_statuses if c.ready]) if i.status.container_statuses else 0
-                total_containers = len(i.spec.containers)
-                restarts = sum([c.restart_count for c in i.status.container_statuses]) if i.status.container_statuses else 0
-                age = get_relative_age(i.status.start_time)
-                pod_list.append(f'{i.metadata.name},{ready_containers}/{total_containers},{i.status.phase},{restarts},{age},{i.status.pod_ip},{i.spec.node_name}')
-            result["raw"] = "NAME,READY,STATUS,RESTARTS,AGE,IP,NODE\n" + "\n".join(pod_list)
-
-        elif action == "get_services":
-            services = k8s_core_v1.list_namespaced_service(namespace="default", watch=False)
-            service_list = []
-            for i in services.items:
-                ports = ",".join([f'{p.port}:{p.node_port}/{p.protocol}' for p in i.spec.ports]) if i.spec.type == "NodePort" else ",".join([f'{p.port}/{p.protocol}' for p in i.spec.ports])
-                age = get_relative_age(i.metadata.creation_timestamp)
-                external_ips = i.spec.external_i_ps if i.spec.external_i_ps else 'none'
-                service_list.append(f'{i.metadata.name},{i.spec.cluster_ip},{external_ips},{ports},{age}')
-            result["raw"] = "NAME,TYPE,CLUSTER-IP,EXTERNAL-IP,PORT(S),AGE\n" + "\n".join(service_list)
-
-        elif action == "get_logs":
-            if "pod" not in intent:
-                result["raw"] = "Error: Pod name is required."
-            else:
-                result["raw"] = k8s_core_v1.read_namespaced_pod_log(name=intent["pod"], namespace="default")
-
-        elif action == "scale":
-            if "name" not in intent or "replicas" not in intent:
-                result["raw"] = "Error: Deployment name and replica count are required."
-            else:
-                k8s_apps_v1.patch_namespaced_deployment_scale(name=intent["name"], namespace="default", body={"spec": {"replicas": intent["replicas"]}})
-                result["raw"] = f"Deployment {intent['name']} scaled to {intent['replicas']} replicas."
-
-        elif action == "get_pod_details":
-            if "pod" not in intent:
-                result["raw"] = "Error: Pod name is required."
-            else:
-                pod_name = intent["pod"]
-                # Find pod by partial name match
-                pods = k8s_core_v1.list_namespaced_pod(namespace="default")
-                matching_pod = None
-                for pod in pods.items:
-                    if pod_name.lower() in pod.metadata.name.lower():
-                        matching_pod = pod
-                        break
-                
-                if matching_pod:
-                    pod_info = matching_pod
-                    status = pod_info.status.phase
-                    ready = "True" if pod_info.status.conditions and any(c.type == "Ready" and c.status == "True" for c in pod_info.status.conditions) else "False"
-                    restarts = sum([c.restart_count for c in pod_info.status.container_statuses]) if pod_info.status.container_statuses else 0
-                    age = get_relative_age(pod_info.status.start_time)
-                    node = pod_info.spec.node_name or "N/A"
-                    ip = pod_info.status.pod_ip or "N/A"
-                    
-                    details = f"""Pod Details for {pod_info.metadata.name}:
-- Status: {status}
-- Ready: {ready}
-- Restarts: {restarts}
-- Age: {age}
-- Node: {node}
-- IP: {ip}
-- Image: {pod_info.spec.containers[0].image if pod_info.spec.containers else 'N/A'}"""
-                    result["raw"] = details
-                else:
-                    result["raw"] = f"Pod matching '{pod_name}' not found."
-
-        elif action == "diagnose_pod":
-            if "pod" not in intent:
-                result["raw"] = "Error: Pod name is required."
-            else:
-                pod_name = intent["pod"]
-                logs = k8s_core_v1.read_namespaced_pod_log(name=pod_name, namespace="default", tail_lines=50)
-                pod_info = k8s_core_v1.read_namespaced_pod(name=pod_name, namespace="default")
-                events = k8s_core_v1.list_namespaced_event(namespace="default", field_selector=f'involvedObject.name={pod_name}')
-                result["logs"] = logs
-                result["description"] = pod_info.to_dict() # More efficient serialization
-                result["events"] = "\n".join([f'{e.last_timestamp} {e.type} {e.reason}: {e.message}' for e in events.items])
-
-        elif action == "error":
-            result["raw"] = intent.get("details", "An unknown error occurred.")
-
-    except client.ApiException as e:
-        logger.error(f"Kubernetes API error: {e}")
-        result["raw"] = f"Error executing Kubernetes command: {e.reason}"
+        context = {}
+        
+        # Get pods
+        pods = k8s_core_v1.list_pod_for_all_namespaces()
+        context['pods'] = [{
+            'name': p.metadata.name,
+            'namespace': p.metadata.namespace,
+            'status': p.status.phase,
+            'ready': sum([1 for c in p.status.container_statuses if c.ready]) if p.status.container_statuses else 0,
+            'total': len(p.spec.containers),
+            'restarts': sum([c.restart_count for c in p.status.container_statuses]) if p.status.container_statuses else 0,
+            'node': p.spec.node_name
+        } for p in pods.items[:20]]  # Limit to 20 pods
+        
+        # Get services
+        services = k8s_core_v1.list_service_for_all_namespaces()
+        context['services'] = [{
+            'name': s.metadata.name,
+            'namespace': s.metadata.namespace,
+            'type': s.spec.type,
+            'cluster_ip': s.spec.cluster_ip
+        } for s in services.items[:10]]  # Limit to 10 services
+        
+        # Get deployments
+        deployments = k8s_apps_v1.list_deployment_for_all_namespaces()
+        context['deployments'] = [{
+            'name': d.metadata.name,
+            'namespace': d.metadata.namespace,
+            'replicas': d.spec.replicas,
+            'ready_replicas': d.status.ready_replicas or 0
+        } for d in deployments.items[:10]]  # Limit to 10 deployments
+        
+        # Get nodes
+        nodes = k8s_core_v1.list_node()
+        context['nodes'] = [{
+            'name': n.metadata.name,
+            'status': 'Ready' if any(c.type == 'Ready' and c.status == 'True' for c in n.status.conditions) else 'NotReady'
+        } for n in nodes.items]
+        
+        return yaml.dump(context, default_flow_style=False)
     except Exception as e:
-        logger.error(f"An unexpected error in k8s_executor: {e}")
-        result["raw"] = "An unexpected error occurred."
+        logger.error(f"Error getting cluster context: {e}")
+        return "Error getting cluster context"
 
-    return {"k8s_result": result}
+def context_agent(state: GraphState):
+    """Gathers current cluster context for the AI model."""
+    logger.info("Gathering cluster context")
+    cluster_context = get_cluster_context()
+    return {"cluster_context": cluster_context}
 
-def responder_agent(state: GraphState):
-    """Formats the result into a user-friendly response, using an LLM for synthesis if needed."""
-    logger.info("Executing Responder Agent")
-    k8s_result = state["k8s_result"]
-    intent = state["intent"]
-    final_response = ""
+def command_generator_agent(state: GraphState):
+    """AI agent that generates kubectl commands based on user request and cluster context."""
+    logger.info("Generating kubectl command")
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", '''You are an expert Kubernetes administrator AI. Based on the user's request and current cluster context, generate the appropriate kubectl command.
 
-    if intent["action"] == "diagnose_pod":
-        if not llm:
-            final_response = "Error: LLM not available for diagnosis."
+RULES:
+1. ONLY output the kubectl command, nothing else
+2. Use proper kubectl syntax
+3. Consider the current cluster state
+4. For dangerous operations, add --dry-run=client first
+5. Use appropriate namespaces based on context
+6. Be precise with resource names from the context
+
+EXAMPLES:
+- "show all pods" -> kubectl get pods --all-namespaces
+- "delete pod xyz" -> kubectl delete pod xyz
+- "scale deployment abc to 5" -> kubectl scale deployment abc --replicas=5
+- "get logs from pod xyz" -> kubectl logs xyz
+- "describe node master" -> kubectl describe node master
+- "create a nginx deployment" -> kubectl create deployment nginx --image=nginx
+- "apply this yaml file" -> kubectl apply -f filename.yaml
+
+CURRENT CLUSTER CONTEXT:
+{cluster_context}
+
+CONVERSATION HISTORY:
+{chat_history}'''),
+        ("human", "{user_message}")
+    ])
+    
+    if not llm:
+        return {"kubectl_command": "echo 'LLM not available'"}
+    
+    chain = prompt | llm
+    response = chain.invoke({
+        "user_message": state["user_message"],
+        "cluster_context": state["cluster_context"],
+        "chat_history": state["chat_history"]
+    })
+    
+    # Extract kubectl command from response
+    command = response.content.strip()
+    # Remove any markdown formatting
+    command = re.sub(r'```.*?\n', '', command)
+    command = re.sub(r'\n```', '', command)
+    command = command.strip()
+    
+    # Ensure it starts with kubectl
+    if not command.startswith('kubectl'):
+        command = f"kubectl {command}"
+    
+    logger.info(f"Generated command: {command}")
+    return {"kubectl_command": command}
+
+def command_executor_agent(state: GraphState):
+    """Executes the kubectl command safely."""
+    logger.info("Executing kubectl command")
+    command = state["kubectl_command"]
+    
+    # Safety checks
+    dangerous_commands = ['delete', 'rm', 'destroy']
+    if any(danger in command.lower() for danger in dangerous_commands):
+        if '--dry-run=client' not in command and '--force' not in command:
+            command += ' --dry-run=client'
+    
+    try:
+        # Execute kubectl command
+        result = subprocess.run(
+            command.split(),
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            output = result.stdout
         else:
-            logger.info("Responder using LLM to synthesize diagnosis.")
-            synthesis_prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are a helpful AI assistant specializing in Kubernetes. Your task is to analyze pod logs, descriptions, and events to explain why a pod is failing in simple terms."),
-                ("human", "Please analyze the following data for pod '{pod_name}' and provide a summary of the problem.\n\n---LOGS (last 50 lines)---\n{logs}\n\n---EVENTS---\n{events}\n\n---DESCRIPTION (YAML)---\n{description}"),
-            ])
-            chain = synthesis_prompt | llm
-            response = chain.invoke({
-                "pod_name": intent["pod"],
-                "logs": k8s_result.get("logs", "Not available."),
-                "events": k8s_result.get("events", "Not available."),
-                "description": str(k8s_result.get("description", "Not available."))
-            })
-            final_response = html.escape(response.content)
+            output = f"Error: {result.stderr}"
+        
+        logger.info(f"Command executed: {command}")
+        logger.info(f"Output length: {len(output)}")
+        
+        return {"command_output": output}
+        
+    except subprocess.TimeoutExpired:
+        return {"command_output": "Command timed out after 30 seconds"}
+    except Exception as e:
+        logger.error(f"Error executing command: {e}")
+        return {"command_output": f"Error executing command: {str(e)}"}
 
-    elif intent["action"] in ["get_pods", "get_services"]:
-        # Convert CSV-like string to markdown table with proper escaping
-        lines = k8s_result.get("raw", "").strip().split('\n')
-        if not lines or not lines[0]:
-            final_response = "No resources found."
-        else:
-            import csv
-            from io import StringIO
-            
-            # Use proper CSV parsing
-            csv_data = StringIO(k8s_result.get("raw", ""))
-            reader = csv.reader(csv_data)
-            rows = list(reader)
-            
-            if rows:
-                header = [html.escape(cell) for cell in rows[0]]
-                table_rows = []
-                for row in rows[1:]:
-                    escaped_row = [html.escape(cell) for cell in row]
-                    table_rows.append(f"| {' | '.join(escaped_row)} |")
-                
-                markdown_table = f"| {' | '.join(header)} |\n|{'|'.join(['---'] * len(header))}|\n"
-                markdown_table += "\n".join(table_rows)
-                final_response = markdown_table
-            else:
-                final_response = "No resources found."
+
+
+def response_formatter_agent(state: GraphState):
+    """Formats the command output into a user-friendly response."""
+    logger.info("Formatting response")
+    
+    command = state["kubectl_command"]
+    output = state["command_output"]
+    
+    # Format the response
+    if output.startswith("Error:"):
+        final_response = f"❌ **Command Failed**\n\n`{command}`\n\n```\n{output}\n```"
     else:
-        # For logs, wrap in markdown code block with escaping
-        raw_result = k8s_result.get("raw", "No result found.")
-        if intent["action"] == "get_logs":
-            final_response = f"```\n{html.escape(raw_result)}\n```"
+        # Check if output looks like a table
+        lines = output.strip().split('\n')
+        if len(lines) > 1 and any(char in lines[0] for char in ['NAME', 'NAMESPACE', 'STATUS']):
+            # Format as table
+            try:
+                header = lines[0].split()
+                rows = []
+                for line in lines[1:]:
+                    if line.strip():
+                        rows.append(line.split())
+                
+                if rows:
+                    # Create markdown table
+                    table = f"| {' | '.join(header)} |\n"
+                    table += f"|{'|'.join(['---'] * len(header))}|\n"
+                    for row in rows:
+                        # Pad row to match header length
+                        while len(row) < len(header):
+                            row.append('')
+                        table += f"| {' | '.join(row[:len(header)])} |\n"
+                    
+                    final_response = f"✅ **Command Executed**\n\n`{command}`\n\n{table}"
+                else:
+                    final_response = f"✅ **Command Executed**\n\n`{command}`\n\n```\n{output}\n```"
+            except:
+                final_response = f"✅ **Command Executed**\n\n`{command}`\n\n```\n{output}\n```"
         else:
-            final_response = html.escape(raw_result)
-
+            # Format as code block
+            final_response = f"✅ **Command Executed**\n\n`{command}`\n\n```\n{output}\n```"
+    
     return {"final_response": final_response}
 
 # --- LangGraph Workflow Definition ---
 workflow = StateGraph(GraphState)
-workflow.add_node("nlu", nlu_agent)
-workflow.add_node("validator", validator_agent)
-workflow.add_node("executor", k8s_executor)
-workflow.add_node("responder", responder_agent)
+workflow.add_node("context", context_agent)
+workflow.add_node("command_gen", command_generator_agent)
+workflow.add_node("executor", command_executor_agent)
+workflow.add_node("formatter", response_formatter_agent)
 
-workflow.set_entry_point("nlu")
-workflow.add_edge("nlu", "validator")
-workflow.add_edge("validator", "executor")
-workflow.add_edge("executor", "responder")
-workflow.add_edge("responder", END)
+workflow.set_entry_point("context")
+workflow.add_edge("context", "command_gen")
+workflow.add_edge("command_gen", "executor")
+workflow.add_edge("executor", "formatter")
+workflow.add_edge("formatter", END)
 
 app_graph = workflow.compile()
 
@@ -361,7 +319,14 @@ async def chat(request: Request, chat_request: ChatRequest, x_session_id: Option
     # Sanitize user input
     sanitized_message = html.escape(chat_request.message.strip())
     
-    inputs = {"user_message": sanitized_message, "chat_history": chat_history}
+    inputs = {
+        "user_message": sanitized_message, 
+        "chat_history": chat_history,
+        "cluster_context": "",
+        "kubectl_command": "",
+        "command_output": "",
+        "final_response": ""
+    }
     
     try:
         result = app_graph.invoke(inputs)
@@ -371,7 +336,12 @@ async def chat(request: Request, chat_request: ChatRequest, x_session_id: Option
         updated_history = chat_history + [HumanMessage(content=sanitized_message), AIMessage(content=final_response)]
         session_cache[session_id] = updated_history
         
-        return {"reply": final_response, "session_id": session_id}
+        return {
+            "reply": final_response, 
+            "session_id": session_id,
+            "command": result.get("kubectl_command", ""),
+            "raw_output": result.get("command_output", "")
+        }
     except Exception as e:
         logger.error(f"Error during graph execution: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
