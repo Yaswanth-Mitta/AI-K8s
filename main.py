@@ -13,8 +13,8 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from cachetools import TTLCache
-
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 
 # --- Configuration ---
 load_dotenv() # Load environment variables from .env file
@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 
 # Session cache with a 5-minute (300 seconds) TTL
 session_cache = TTLCache(maxsize=1024, ttl=300)
+
+# --- Helper Functions ---
+def get_relative_age(timestamp):
+    """Converts a datetime object to a human-readable relative age string."""
+    if not timestamp:
+        return "N/A"
+    now = datetime.now(timezone.utc)
+    age = now - timestamp
+    
+    if age.days > 0:
+        return f"{age.days}d"
+    elif age.seconds >= 3600:
+        return f"{age.seconds // 3600}h"
+    elif age.seconds >= 60:
+        return f"{age.seconds // 60}m"
+    else:
+        return f"{age.seconds}s"
 
 # --- Kubernetes Configuration ---
 try:
@@ -47,7 +64,7 @@ try:
     )
     llm = ChatBedrock(
         client=bedrock_runtime,
-        model_id="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        model_id=os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
     )
     logger.info("Bedrock client created successfully.")
 except (NoCredentialsError, PartialCredentialsError) as e:
@@ -81,18 +98,19 @@ def nlu_agent(state: GraphState):
                 '''You are an expert at converting natural language to a JSON intent for a Kubernetes chat bot.
                 Use the conversation history to understand context and resolve references.
                 Your output must be a single, valid JSON object.
-                Valid actions are: "get_pods", "get_logs", "scale", "diagnose_pod".
+                Valid actions are: "get_pods", "get_services", "get_logs", "scale", "diagnose_pod".
 
                 --- CONVERSATION HISTORY ---
                 {chat_history}
                 
                 --- EXAMPLES ---
                 User: "show me pods" -> {{ "action": "get_pods" }}
+                User: "list all services" -> {{ "action": "get_services" }}
                 User: "scale frontend to 3 replicas" -> {{ "action": "scale", "resource": "deployment", "name": "frontend", "replicas": 3 }}
                 User: "get logs for backend-abc" -> {{ "action": "get_logs", "pod": "backend-abc" }}
                 
                 --- CONTEXTUAL EXAMPLES ---
-                (History shows a pod named 'backend-xyz-123' is in CrashLoopBackOff)
+                (History shows a pod named '''backend-xyz-123''' is in CrashLoopBackOff)
                 User: "why is that one failing?" -> {{ "action": "diagnose_pod", "pod": "backend-xyz-123" }}
                 User: "get logs for that pod" -> {{ "action": "get_logs", "pod": "backend-xyz-123" }}
                 '''
@@ -121,7 +139,7 @@ def validator_agent(state: GraphState):
     intent = state.get("intent", {})
     action = intent.get("action")
     
-    if not action or action not in ["get_pods", "get_logs", "scale", "diagnose_pod"]:
+    if not action or action not in ["get_pods", "get_services", "get_logs", "scale", "diagnose_pod"]:
         intent["action"] = "error"
         intent["details"] = "Invalid action specified."
     # Add more specific validation as needed for diagnose_pod, etc.
@@ -142,24 +160,34 @@ def k8s_executor(state: GraphState):
                 ready_containers = sum([1 for c in i.status.container_statuses if c.ready]) if i.status.container_statuses else 0
                 total_containers = len(i.spec.containers)
                 restarts = sum([c.restart_count for c in i.status.container_statuses]) if i.status.container_statuses else 0
-                pod_list.append(f"{i.metadata.name},{ready_containers}/{total_containers},{i.status.phase},{restarts},{i.status.start_time},{i.status.pod_ip},{i.spec.node_name}")
+                age = get_relative_age(i.status.start_time)
+                pod_list.append(f'{i.metadata.name},{ready_containers}/{total_containers},{i.status.phase},{restarts},{age},{i.status.pod_ip},{i.spec.node_name}')
             result["raw"] = "NAME,READY,STATUS,RESTARTS,AGE,IP,NODE\n" + "\n".join(pod_list)
+
+        elif action == "get_services":
+            services = k8s_core_v1.list_namespaced_service(namespace="default", watch=False)
+            service_list = []
+            for i in services.items:
+                ports = ",".join([f'{p.port}:{p.node_port}/{p.protocol}' for p in i.spec.ports]) if i.spec.type == "NodePort" else ",".join([f'{p.port}/{p.protocol}' for p in i.spec.ports])
+                age = get_relative_age(i.metadata.creation_timestamp)
+                service_list.append(f'{i.metadata.name},{i.spec.cluster_ip},{i.spec.external_i_ps if i.spec.external_i_ps else '<none>'},{ports},{age}')
+            result["raw"] = "NAME,TYPE,CLUSTER-IP,EXTERNAL-IP,PORT(S),AGE\n" + "\n".join(service_list)
 
         elif action == "get_logs":
             result["raw"] = k8s_core_v1.read_namespaced_pod_log(name=intent["pod"], namespace="default")
 
         elif action == "scale":
             k8s_apps_v1.patch_namespaced_deployment_scale(name=intent["name"], namespace="default", body={"spec": {"replicas": intent["replicas"]}})
-            result["raw"] = f"Deployment {intent['name']} scaled to {intent['replicas']} replicas."
+            result["raw"] = f'Deployment {intent['name']} scaled to {intent['replicas']} replicas.'
 
         elif action == "diagnose_pod":
             pod_name = intent["pod"]
             logs = k8s_core_v1.read_namespaced_pod_log(name=pod_name, namespace="default", tail_lines=50)
             pod_info = k8s_core_v1.read_namespaced_pod(name=pod_name, namespace="default")
-            events = k8s_core_v1.list_namespaced_event(namespace="default", field_selector=f"involvedObject.name={pod_name}")
+            events = k8s_core_v1.list_namespaced_event(namespace="default", field_selector=f'involvedObject.name={pod_name}')
             result["logs"] = logs
             result["description"] = pod_info.to_str() # Use a serializable format
-            result["events"] = "\n".join([f"{e.last_timestamp} {e.type} {e.reason}: {e.message}" for e in events.items])
+            result["events"] = "\n".join([f'{e.last_timestamp} {e.type} {e.reason}: {e.message}' for e in events.items])
 
         elif action == "error":
             result["raw"] = intent.get("details", "An unknown error occurred.")
@@ -195,16 +223,25 @@ def responder_agent(state: GraphState):
         })
         final_response = response.content
 
-    elif intent["action"] == "get_pods":
+    elif intent["action"] in ["get_pods", "get_services"]:
+        # Convert CSV-like string to markdown table
         lines = k8s_result.get("raw", "").strip().split('\n')
-        header = lines[0].split(',')
-        rows = [line.split(',') for line in lines[1:]]
-        markdown_table = f"| {' | '.join(header)} |\n|{'---' * len(header)}|\n"
-        for row in rows:
-            markdown_table += f"| {' | '.join(row)} |\n"
-        final_response = markdown_table
+        if not lines or not lines[0]:
+            final_response = "No resources found."
+        else:
+            header = lines[0].split(',')
+            rows = [line.split(',') for line in lines[1:]]
+            markdown_table = f"| {' | '.join(header)} |\n|{'|'.join(['---'] * len(header))}|\n"
+            for row in rows:
+                markdown_table += f"| {' | '.join(row)} |\n"
+            final_response = markdown_table
     else:
-        final_response = k8s_result.get("raw", "No result found.")
+        # For logs, wrap in markdown code block
+        raw_result = k8s_result.get("raw", "No result found.")
+        if intent["action"] == "get_logs":
+            final_response = f"```\n{raw_result}\n```"
+        else:
+            final_response = raw_result
 
     return {"final_response": final_response}
 
