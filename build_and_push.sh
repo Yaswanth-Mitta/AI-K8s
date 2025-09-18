@@ -1,16 +1,35 @@
 #!/bin/bash
+# This script automates building and pushing the Docker image.
+
 set -e
 
 IMAGE_NAME="ai-k8s-chat"
 IMAGE_TAG="latest"
 
-# Prompt for Docker Hub username
-read -p "Please enter your Docker Hub username and press ENTER: " DOCKER_USERNAME
+echo "🚀 Starting build and push process..."
 
-if [ -z "$DOCKER_USERNAME" ]; then
-    echo "Username cannot be empty."
+# --- Step 1: Check for and load .env file ---
+echo "🔎 Checking for .env file..."
+if [ ! -f .env ]; then
+    echo "❌ Error: .env file not found. Please create one from .env.example and fill it out."
     exit 1
 fi
+
+# Source the .env file in a way that handles special characters safely.
+set -a
+source .env
+set +a
+
+echo "✅ .env file loaded."
+
+# --- Step 2: Verify required DOCKER_USERNAME ---
+echo "🔎 Verifying Docker Hub username..."
+if [ -z "${DOCKER_USERNAME}" ]; then
+    echo "❌ Error: DOCKER_USERNAME is not set in the .env file."
+    exit 1
+fi
+echo "✅ Docker Hub username '${DOCKER_USERNAME}' found."
+
 
 FULL_IMAGE_NAME="${DOCKER_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
 
@@ -18,11 +37,10 @@ echo
 echo "Building image: ${FULL_IMAGE_NAME}"
 echo
 
-# Build, Push, and Login
 docker build -t "${FULL_IMAGE_NAME}" .
 
 echo
-echo "Logging into Docker Hub. Please enter your credentials."
+echo "Logging into Docker Hub..."
 docker login
 
 echo
@@ -33,5 +51,3 @@ echo
 echo "--- Success! ---"
 echo
 echo "Image ${FULL_IMAGE_NAME} has been pushed."
-echo
-echo "IMPORTANT: Remember to update the 'image:' line in k8s/deployment.yaml to match this image name before you deploy."

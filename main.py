@@ -110,7 +110,7 @@ def nlu_agent(state: GraphState):
                 User: "get logs for backend-abc" -> {{ "action": "get_logs", "pod": "backend-abc" }}
                 
                 --- CONTEXTUAL EXAMPLES ---
-                (History shows a pod named '''backend-xyz-123''' is in CrashLoopBackOff)
+                (History shows a pod named 'backend-xyz-123' is in CrashLoopBackOff)
                 User: "why is that one failing?" -> {{ "action": "diagnose_pod", "pod": "backend-xyz-123" }}
                 User: "get logs for that pod" -> {{ "action": "get_logs", "pod": "backend-xyz-123" }}
                 '''
