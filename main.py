@@ -93,8 +93,13 @@ class GraphState(TypedDict):
     user_message: str
     chat_history: List[BaseMessage]
     cluster_context: str
-    kubectl_command: str
-    command_output: str
+    current_step: int
+    max_steps: int
+    command_history: List[dict]
+    current_action: str
+    current_output: str
+    analysis_result: str
+    next_action_needed: bool
     final_response: str
 
 # --- LangGraph Nodes (Updated for Conversational Context) ---
@@ -152,154 +157,357 @@ def context_agent(state: GraphState):
     cluster_context = get_cluster_context()
     return {"cluster_context": cluster_context}
 
-def command_generator_agent(state: GraphState):
-    """AI agent that generates kubectl commands based on user request and cluster context."""
-    logger.info("Generating kubectl command")
+def command_planner_agent(state: GraphState):
+    """AI agent that plans the next action based on user request and previous results."""
+    logger.info(f"Planning action - Step {state.get('current_step', 1)}")
+    
+    # Initialize state if first step
+    if state.get("current_step", 0) == 0:
+        return {
+            "current_step": 1,
+            "max_steps": 5,
+            "command_history": [],
+            "next_action_needed": True
+        }
+    
+    command_history_str = "\n".join([
+        f"Step {i+1}: {cmd['action']} -> {cmd['output'][:200]}..."
+        for i, cmd in enumerate(state.get("command_history", []))
+    ])
     
     prompt = ChatPromptTemplate.from_messages([
-        ("system", '''You are an expert Kubernetes administrator AI. Based on the user's request and current cluster context, generate the appropriate kubectl command.
+        ("system", '''You are an expert Kubernetes administrator AI that can chain multiple commands to solve complex problems.
 
-RULES:
-1. ONLY output the kubectl command, nothing else
-2. Use proper kubectl syntax
-3. Consider the current cluster state
-4. For dangerous operations, add --dry-run=client first
-5. Use appropriate namespaces based on context
-6. Be precise with resource names from the context
+Based on the user's request and previous command results, determine the next action.
 
-EXAMPLES:
-- "show all pods" -> kubectl get pods --all-namespaces
-- "delete pod xyz" -> kubectl delete pod xyz
-- "scale deployment abc to 5" -> kubectl scale deployment abc --replicas=5
-- "get logs from pod xyz" -> kubectl logs xyz
-- "describe node master" -> kubectl describe node master
-- "create a nginx deployment" -> kubectl create deployment nginx --image=nginx
-- "apply this yaml file" -> kubectl apply -f filename.yaml
+Output ONLY a JSON object:
+- If more investigation needed: {"action": "action_name", "params": {...}, "continue": true, "reasoning": "why this action"}
+- If task complete: {"action": "complete", "continue": false, "summary": "final summary"}
 
-CURRENT CLUSTER CONTEXT:
+AVAILABLE ACTIONS:
+- get_pods, get_services, get_deployments, get_nodes
+- describe_pod, get_logs, get_events
+- get_replicasets, get_configmaps, get_secrets
+- analyze_resource_usage, check_pod_dependencies
+
+USER REQUEST: {user_message}
+
+CLUSTER CONTEXT:
 {cluster_context}
 
-CONVERSATION HISTORY:
-{chat_history}'''),
-        ("human", "{user_message}")
+PREVIOUS COMMANDS:
+{command_history}
+
+CURRENT STEP: {current_step}/{max_steps}'''),
+        ("human", "What should I do next to fully answer the user's request?")
     ])
     
     if not llm:
-        return {"kubectl_command": "echo 'LLM not available'"}
+        return {"current_action": '{"action": "get_pods", "namespace": "all"}'}
     
     chain = prompt | llm
     response = chain.invoke({
         "user_message": state["user_message"],
         "cluster_context": state["cluster_context"],
-        "chat_history": state["chat_history"]
+        "command_history": command_history_str,
+        "current_step": state.get("current_step", 1),
+        "max_steps": state.get("max_steps", 5)
     })
     
-    # Extract kubectl command from response
-    command = response.content.strip()
-    # Remove any markdown formatting
-    command = re.sub(r'```.*?\n', '', command)
-    command = re.sub(r'\n```', '', command)
-    command = command.strip()
-    
-    # Ensure it starts with kubectl
-    if not command.startswith('kubectl'):
-        command = f"kubectl {command}"
-    
-    logger.info(f"Generated command: {command}")
-    return {"kubectl_command": command}
+    try:
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response.content)
+        if json_match:
+            action_data = json.loads(json_match.group())
+            logger.info(f"Planned action: {action_data}")
+            
+            if action_data.get("continue", True) and state.get("current_step", 1) < state.get("max_steps", 5):
+                return {
+                    "current_action": json.dumps(action_data),
+                    "next_action_needed": True
+                }
+            else:
+                return {
+                    "current_action": json.dumps(action_data),
+                    "next_action_needed": False
+                }
+        else:
+            return {"current_action": '{"action": "complete", "continue": false}'}
+    except Exception as e:
+        logger.error(f"Error parsing action: {e}")
+        return {"current_action": '{"action": "complete", "continue": false}'}
 
-def command_executor_agent(state: GraphState):
-    """Executes the kubectl command safely."""
-    logger.info("Executing kubectl command")
-    command = state["kubectl_command"]
-    
-    # Safety checks
-    dangerous_commands = ['delete', 'rm', 'destroy']
-    if any(danger in command.lower() for danger in dangerous_commands):
-        if '--dry-run=client' not in command and '--force' not in command:
-            command += ' --dry-run=client'
+def action_executor_agent(state: GraphState):
+    """Executes Kubernetes operations using the Python client."""
+    logger.info("Executing Kubernetes operation")
     
     try:
-        # Execute kubectl command
-        result = subprocess.run(
-            command.split(),
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        action_data = json.loads(state["current_action"])
+        action = action_data.get("action")
         
-        if result.returncode == 0:
-            output = result.stdout
+        if action == "complete":
+            return {"current_output": "Task completed"}
+        
+        if action == "get_pods":
+            namespace = action_data.get("namespace", "all")
+            if namespace == "all":
+                pods = k8s_core_v1.list_pod_for_all_namespaces()
+            else:
+                pods = k8s_core_v1.list_namespaced_pod(namespace=namespace)
+            
+            output = "NAME\tNAMESPACE\tSTATUS\tREADY\tRESTARTS\tAGE\n"
+            for pod in pods.items:
+                ready = sum([1 for c in pod.status.container_statuses if c.ready]) if pod.status.container_statuses else 0
+                total = len(pod.spec.containers)
+                restarts = sum([c.restart_count for c in pod.status.container_statuses]) if pod.status.container_statuses else 0
+                age = get_relative_age(pod.status.start_time)
+                output += f"{pod.metadata.name}\t{pod.metadata.namespace}\t{pod.status.phase}\t{ready}/{total}\t{restarts}\t{age}\n"
+        
+        elif action == "get_services":
+            namespace = action_data.get("namespace", "all")
+            if namespace == "all":
+                services = k8s_core_v1.list_service_for_all_namespaces()
+            else:
+                services = k8s_core_v1.list_namespaced_service(namespace=namespace)
+            
+            output = "NAME\tNAMESPACE\tTYPE\tCLUSTER-IP\tPORTS\n"
+            for svc in services.items:
+                ports = ",".join([f"{p.port}/{p.protocol}" for p in svc.spec.ports]) if svc.spec.ports else "None"
+                output += f"{svc.metadata.name}\t{svc.metadata.namespace}\t{svc.spec.type}\t{svc.spec.cluster_ip}\t{ports}\n"
+        
+        elif action == "get_logs":
+            pod_name = action_data.get("pod")
+            namespace = action_data.get("namespace", "default")
+            if pod_name:
+                output = k8s_core_v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=100)
+            else:
+                output = "Error: Pod name required"
+        
+        elif action == "describe_pod":
+            pod_name = action_data.get("pod")
+            namespace = action_data.get("namespace", "default")
+            if pod_name:
+                pod = k8s_core_v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+                output = f"Name: {pod.metadata.name}\n"
+                output += f"Namespace: {pod.metadata.namespace}\n"
+                output += f"Status: {pod.status.phase}\n"
+                output += f"Node: {pod.spec.node_name}\n"
+                output += f"IP: {pod.status.pod_ip}\n"
+                if pod.spec.containers:
+                    output += f"Image: {pod.spec.containers[0].image}\n"
+            else:
+                output = "Error: Pod name required"
+        
+        elif action == "get_nodes":
+            nodes = k8s_core_v1.list_node()
+            output = "NAME\tSTATUS\tROLES\tAGE\n"
+            for node in nodes.items:
+                status = "Ready" if any(c.type == "Ready" and c.status == "True" for c in node.status.conditions) else "NotReady"
+                roles = ",".join(node.metadata.labels.get("kubernetes.io/role", "worker").split(","))
+                age = get_relative_age(node.metadata.creation_timestamp)
+                output += f"{node.metadata.name}\t{status}\t{roles}\t{age}\n"
+        
+        elif action == "get_deployments":
+            namespace = action_data.get("params", {}).get("namespace", "all")
+            if namespace == "all":
+                deployments = k8s_apps_v1.list_deployment_for_all_namespaces()
+            else:
+                deployments = k8s_apps_v1.list_namespaced_deployment(namespace=namespace)
+            
+            output = "NAME\tNAMESPACE\tREADY\tUP-TO-DATE\tAVAILABLE\n"
+            for dep in deployments.items:
+                ready = dep.status.ready_replicas or 0
+                replicas = dep.spec.replicas or 0
+                available = dep.status.available_replicas or 0
+                output += f"{dep.metadata.name}\t{dep.metadata.namespace}\t{ready}/{replicas}\t{replicas}\t{available}\n"
+        
+        elif action == "get_replicasets":
+            namespace = action_data.get("params", {}).get("namespace", "all")
+            if namespace == "all":
+                replicasets = k8s_apps_v1.list_replica_set_for_all_namespaces()
+            else:
+                replicasets = k8s_apps_v1.list_namespaced_replica_set(namespace=namespace)
+            
+            output = "NAME\tNAMESPACE\tDESIRED\tCURRENT\tREADY\tOWNER\n"
+            for rs in replicasets.items:
+                owner = rs.metadata.owner_references[0].name if rs.metadata.owner_references else "None"
+                output += f"{rs.metadata.name}\t{rs.metadata.namespace}\t{rs.spec.replicas}\t{rs.status.replicas or 0}\t{rs.status.ready_replicas or 0}\t{owner}\n"
+        
+        elif action == "get_events":
+            namespace = action_data.get("params", {}).get("namespace", "default")
+            events = k8s_core_v1.list_namespaced_event(namespace=namespace)
+            
+            output = "TYPE\tREASON\tOBJECT\tMESSAGE\tTIME\n"
+            for event in events.items[-10:]:  # Last 10 events
+                obj_name = f"{event.involved_object.kind}/{event.involved_object.name}"
+                output += f"{event.type}\t{event.reason}\t{obj_name}\t{event.message[:50]}...\t{event.last_timestamp}\n"
+        
+        elif action == "check_pod_dependencies":
+            pod_name = action_data.get("params", {}).get("pod")
+            namespace = action_data.get("params", {}).get("namespace", "default")
+            
+            if pod_name:
+                # Get pod details
+                pod = k8s_core_v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+                
+                # Find owning ReplicaSet/Deployment
+                output = f"Pod Dependencies for {pod_name}:\n"
+                if pod.metadata.owner_references:
+                    for owner in pod.metadata.owner_references:
+                        output += f"Owned by: {owner.kind}/{owner.name}\n"
+                        
+                        if owner.kind == "ReplicaSet":
+                            rs = k8s_apps_v1.read_namespaced_replica_set(name=owner.name, namespace=namespace)
+                            if rs.metadata.owner_references:
+                                for rs_owner in rs.metadata.owner_references:
+                                    output += f"  Which is owned by: {rs_owner.kind}/{rs_owner.name}\n"
+                else:
+                    output += "No owner references found\n"
+            else:
+                output = "Error: Pod name required"
+        
         else:
-            output = f"Error: {result.stderr}"
+            output = f"Unknown action: {action}"
         
-        logger.info(f"Command executed: {command}")
-        logger.info(f"Output length: {len(output)}")
+        # Update command history
+        command_history = state.get("command_history", [])
+        command_history.append({
+            "step": state.get("current_step", 1),
+            "action": action,
+            "params": action_data.get("params", {}),
+            "output": output[:500]  # Truncate for history
+        })
         
-        return {"command_output": output}
+        return {
+            "current_output": output,
+            "command_history": command_history,
+            "current_step": state.get("current_step", 1) + 1
+        }
         
-    except subprocess.TimeoutExpired:
-        return {"command_output": "Command timed out after 30 seconds"}
+    except json.JSONDecodeError:
+        return {"current_output": "Error: Invalid action format"}
+    except client.ApiException as e:
+        return {"current_output": f"Kubernetes API Error: {e.reason}"}
     except Exception as e:
-        logger.error(f"Error executing command: {e}")
-        return {"command_output": f"Error executing command: {str(e)}"}
+        logger.error(f"Error executing operation: {e}")
+        return {"current_output": f"Error: {str(e)}"}
 
 
 
-def response_formatter_agent(state: GraphState):
-    """Formats the command output into a user-friendly response."""
-    logger.info("Formatting response")
+def analysis_agent(state: GraphState):
+    """AI agent that analyzes command output and determines next steps."""
+    logger.info("Analyzing results")
     
-    command = state["kubectl_command"]
-    output = state["command_output"]
+    if not llm or not state.get("next_action_needed", True):
+        return {"analysis_result": "Analysis complete", "next_action_needed": False}
     
-    # Format the response
-    if output.startswith("Error:"):
-        final_response = f"❌ **Command Failed**\n\n`{command}`\n\n```\n{output}\n```"
-    else:
-        # Check if output looks like a table
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", '''You are an expert Kubernetes analyst. Analyze the command output and determine if more investigation is needed.
+
+Based on the output, provide:
+1. Analysis of what the data shows
+2. Whether more commands are needed
+3. If needed, suggest the next action
+
+Output JSON: {"analysis": "your analysis", "needs_more": true/false, "next_suggestion": "suggested action"}'''),
+        ("human", "Current output:\n{output}\n\nUser's original request: {user_message}")
+    ])
+    
+    chain = prompt | llm
+    response = chain.invoke({
+        "output": state["current_output"],
+        "user_message": state["user_message"]
+    })
+    
+    try:
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response.content)
+        if json_match:
+            analysis = json.loads(json_match.group())
+            return {
+                "analysis_result": analysis.get("analysis", ""),
+                "next_action_needed": analysis.get("needs_more", False)
+            }
+    except:
+        pass
+    
+    return {"analysis_result": "Analysis complete", "next_action_needed": False}
+
+def final_formatter_agent(state: GraphState):
+    """Formats the final comprehensive response."""
+    logger.info("Creating final response")
+    
+    command_history = state.get("command_history", [])
+    
+    if not command_history:
+        return {"final_response": "No operations performed."}
+    
+    # Build comprehensive response
+    final_response = f"🔍 **Investigation Complete** ({len(command_history)} steps)\n\n"
+    
+    for i, cmd in enumerate(command_history, 1):
+        action_name = cmd['action'].replace('_', ' ').title()
+        final_response += f"### Step {i}: {action_name}\n\n"
+        
+        # Format output as table if possible
+        output = cmd['output']
         lines = output.strip().split('\n')
-        if len(lines) > 1 and any(char in lines[0] for char in ['NAME', 'NAMESPACE', 'STATUS']):
-            # Format as table
+        
+        if len(lines) > 1 and '\t' in lines[0]:
             try:
-                header = lines[0].split()
+                header = lines[0].split('\t')
                 rows = []
-                for line in lines[1:]:
+                for line in lines[1:5]:  # Limit to first 5 rows
                     if line.strip():
-                        rows.append(line.split())
+                        row_data = line.split('\t')
+                        while len(row_data) < len(header):
+                            row_data.append('')
+                        rows.append(row_data[:len(header)])
                 
                 if rows:
-                    # Create markdown table
                     table = f"| {' | '.join(header)} |\n"
                     table += f"|{'|'.join(['---'] * len(header))}|\n"
                     for row in rows:
-                        # Pad row to match header length
-                        while len(row) < len(header):
-                            row.append('')
-                        table += f"| {' | '.join(row[:len(header)])} |\n"
-                    
-                    final_response = f"✅ **Command Executed**\n\n`{command}`\n\n{table}"
+                        table += f"| {' | '.join(row)} |\n"
+                    final_response += f"{table}\n"
                 else:
-                    final_response = f"✅ **Command Executed**\n\n`{command}`\n\n```\n{output}\n```"
+                    final_response += f"```\n{output[:300]}...\n```\n\n"
             except:
-                final_response = f"✅ **Command Executed**\n\n`{command}`\n\n```\n{output}\n```"
+                final_response += f"```\n{output[:300]}...\n```\n\n"
         else:
-            # Format as code block
-            final_response = f"✅ **Command Executed**\n\n`{command}`\n\n```\n{output}\n```"
+            final_response += f"```\n{output[:300]}...\n```\n\n"
+    
+    # Add analysis if available
+    if state.get("analysis_result"):
+        final_response += f"### 📊 Analysis\n\n{state['analysis_result']}\n\n"
     
     return {"final_response": final_response}
+
+def should_continue(state: GraphState) -> str:
+    """Determines if more actions are needed."""
+    if state.get("next_action_needed", False) and state.get("current_step", 1) < state.get("max_steps", 5):
+        return "continue"
+    else:
+        return "finish"
 
 # --- LangGraph Workflow Definition ---
 workflow = StateGraph(GraphState)
 workflow.add_node("context", context_agent)
-workflow.add_node("command_gen", command_generator_agent)
-workflow.add_node("executor", command_executor_agent)
-workflow.add_node("formatter", response_formatter_agent)
+workflow.add_node("planner", command_planner_agent)
+workflow.add_node("executor", action_executor_agent)
+workflow.add_node("analyzer", analysis_agent)
+workflow.add_node("formatter", final_formatter_agent)
 
 workflow.set_entry_point("context")
-workflow.add_edge("context", "command_gen")
-workflow.add_edge("command_gen", "executor")
-workflow.add_edge("executor", "formatter")
+workflow.add_edge("context", "planner")
+workflow.add_edge("planner", "executor")
+workflow.add_edge("executor", "analyzer")
+workflow.add_conditional_edges(
+    "analyzer",
+    should_continue,
+    {
+        "continue": "planner",
+        "finish": "formatter"
+    }
+)
 workflow.add_edge("formatter", END)
 
 app_graph = workflow.compile()
@@ -323,8 +531,13 @@ async def chat(request: Request, chat_request: ChatRequest, x_session_id: Option
         "user_message": sanitized_message, 
         "chat_history": chat_history,
         "cluster_context": "",
-        "kubectl_command": "",
-        "command_output": "",
+        "current_step": 0,
+        "max_steps": 5,
+        "command_history": [],
+        "current_action": "",
+        "current_output": "",
+        "analysis_result": "",
+        "next_action_needed": True,
         "final_response": ""
     }
     
@@ -339,8 +552,8 @@ async def chat(request: Request, chat_request: ChatRequest, x_session_id: Option
         return {
             "reply": final_response, 
             "session_id": session_id,
-            "command": result.get("kubectl_command", ""),
-            "raw_output": result.get("command_output", "")
+            "steps_executed": len(result.get("command_history", [])),
+            "command_history": result.get("command_history", [])
         }
     except Exception as e:
         logger.error(f"Error during graph execution: {e}")
