@@ -1,13 +1,16 @@
 import os
 import json
 import logging
-from fastapi import FastAPI, HTTPException, Request
+import html
+import uuid
+import re
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langchain_aws import ChatBedrock
 from kubernetes import client, config
-from typing import TypedDict, List
+from typing import TypedDict, List, Optional
 import boto3
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from langchain.prompts import ChatPromptTemplate
@@ -30,6 +33,9 @@ def get_relative_age(timestamp):
     if not timestamp:
         return "N/A"
     now = datetime.now(timezone.utc)
+    # Ensure timestamp is timezone-aware
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
     age = now - timestamp
     
     if age.days > 0:
@@ -75,7 +81,7 @@ except (NoCredentialsError, PartialCredentialsError) as e:
 app = FastAPI()
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=1000, description="User message")
 
 # --- LangGraph State (with Memory) ---
 class GraphState(TypedDict):
@@ -125,13 +131,18 @@ def nlu_agent(state: GraphState):
     response = chain.invoke({"user_message": state["user_message"], "chat_history": state["chat_history"]})
     
     try:
-        json_str = response.content[response.content.find('{'):response.content.rfind('}')+1]
-        intent = json.loads(json_str)
-        logger.info(f"NLU generated intent: {intent}")
-        return {"intent": intent}
-    except (json.JSONDecodeError, IndexError) as e:
+        # Use regex for better JSON extraction
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response.content)
+        if json_match:
+            json_str = json_match.group()
+            intent = json.loads(json_str)
+            logger.info(f"NLU generated intent: {intent}")
+            return {"intent": intent}
+        else:
+            raise ValueError("No JSON found in response")
+    except (json.JSONDecodeError, ValueError) as e:
         logger.error(f"Error decoding LLM response into JSON: {e}")
-        return {"intent": {"action": "error", "details": "I couldn't understand that request."}}
+        return {"intent": {"action": "error", "details": "I couldn't understand that request."}}}
 
 def validator_agent(state: GraphState):
     """Validates the intent from the NLU agent."""
@@ -142,7 +153,18 @@ def validator_agent(state: GraphState):
     if not action or action not in ["get_pods", "get_services", "get_logs", "scale", "diagnose_pod"]:
         intent["action"] = "error"
         intent["details"] = "Invalid action specified."
-    # Add more specific validation as needed for diagnose_pod, etc.
+    
+    # Validate required parameters
+    if action == "get_logs" and not intent.get("pod"):
+        intent["action"] = "error"
+        intent["details"] = "Pod name is required for getting logs."
+    elif action == "scale" and (not intent.get("name") or not intent.get("replicas")):
+        intent["action"] = "error"
+        intent["details"] = "Deployment name and replica count are required for scaling."
+    elif action == "diagnose_pod" and not intent.get("pod"):
+        intent["action"] = "error"
+        intent["details"] = "Pod name is required for diagnosis."
+    
     return {"intent": intent}
 
 def k8s_executor(state: GraphState):
@@ -174,20 +196,29 @@ def k8s_executor(state: GraphState):
             result["raw"] = "NAME,TYPE,CLUSTER-IP,EXTERNAL-IP,PORT(S),AGE\n" + "\n".join(service_list)
 
         elif action == "get_logs":
-            result["raw"] = k8s_core_v1.read_namespaced_pod_log(name=intent["pod"], namespace="default")
+            if "pod" not in intent:
+                result["raw"] = "Error: Pod name is required."
+            else:
+                result["raw"] = k8s_core_v1.read_namespaced_pod_log(name=intent["pod"], namespace="default")
 
         elif action == "scale":
-            k8s_apps_v1.patch_namespaced_deployment_scale(name=intent["name"], namespace="default", body={"spec": {"replicas": intent["replicas"]}})
-            result["raw"] = f'Deployment {intent['name']} scaled to {intent['replicas']} replicas.'
+            if "name" not in intent or "replicas" not in intent:
+                result["raw"] = "Error: Deployment name and replica count are required."
+            else:
+                k8s_apps_v1.patch_namespaced_deployment_scale(name=intent["name"], namespace="default", body={"spec": {"replicas": intent["replicas"]}})
+                result["raw"] = f"Deployment {intent['name']} scaled to {intent['replicas']} replicas."
 
         elif action == "diagnose_pod":
-            pod_name = intent["pod"]
-            logs = k8s_core_v1.read_namespaced_pod_log(name=pod_name, namespace="default", tail_lines=50)
-            pod_info = k8s_core_v1.read_namespaced_pod(name=pod_name, namespace="default")
-            events = k8s_core_v1.list_namespaced_event(namespace="default", field_selector=f'involvedObject.name={pod_name}')
-            result["logs"] = logs
-            result["description"] = pod_info.to_str() # Use a serializable format
-            result["events"] = "\n".join([f'{e.last_timestamp} {e.type} {e.reason}: {e.message}' for e in events.items])
+            if "pod" not in intent:
+                result["raw"] = "Error: Pod name is required."
+            else:
+                pod_name = intent["pod"]
+                logs = k8s_core_v1.read_namespaced_pod_log(name=pod_name, namespace="default", tail_lines=50)
+                pod_info = k8s_core_v1.read_namespaced_pod(name=pod_name, namespace="default")
+                events = k8s_core_v1.list_namespaced_event(namespace="default", field_selector=f'involvedObject.name={pod_name}')
+                result["logs"] = logs
+                result["description"] = pod_info.to_dict() # More efficient serialization
+                result["events"] = "\n".join([f'{e.last_timestamp} {e.type} {e.reason}: {e.message}' for e in events.items])
 
         elif action == "error":
             result["raw"] = intent.get("details", "An unknown error occurred.")
@@ -209,39 +240,56 @@ def responder_agent(state: GraphState):
     final_response = ""
 
     if intent["action"] == "diagnose_pod":
-        logger.info("Responder using LLM to synthesize diagnosis.")
-        synthesis_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful AI assistant specializing in Kubernetes. Your task is to analyze pod logs, descriptions, and events to explain why a pod is failing in simple terms."),
-            ("human", "Please analyze the following data for pod '{pod_name}' and provide a summary of the problem.\n\n---LOGS (last 50 lines)---\n{logs}\n\n---EVENTS---\n{events}\n\n---DESCRIPTION (YAML)---\n{description}"),
-        ])
-        chain = synthesis_prompt | llm
-        response = chain.invoke({
-            "pod_name": intent["pod"],
-            "logs": k8s_result.get("logs", "Not available."),
-            "events": k8s_result.get("events", "Not available."),
-            "description": k8s_result.get("description", "Not available.")
-        })
-        final_response = response.content
+        if not llm:
+            final_response = "Error: LLM not available for diagnosis."
+        else:
+            logger.info("Responder using LLM to synthesize diagnosis.")
+            synthesis_prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a helpful AI assistant specializing in Kubernetes. Your task is to analyze pod logs, descriptions, and events to explain why a pod is failing in simple terms."),
+                ("human", "Please analyze the following data for pod '{pod_name}' and provide a summary of the problem.\n\n---LOGS (last 50 lines)---\n{logs}\n\n---EVENTS---\n{events}\n\n---DESCRIPTION (YAML)---\n{description}"),
+            ])
+            chain = synthesis_prompt | llm
+            response = chain.invoke({
+                "pod_name": intent["pod"],
+                "logs": k8s_result.get("logs", "Not available."),
+                "events": k8s_result.get("events", "Not available."),
+                "description": str(k8s_result.get("description", "Not available."))
+            })
+            final_response = html.escape(response.content)
 
     elif intent["action"] in ["get_pods", "get_services"]:
-        # Convert CSV-like string to markdown table
+        # Convert CSV-like string to markdown table with proper escaping
         lines = k8s_result.get("raw", "").strip().split('\n')
         if not lines or not lines[0]:
             final_response = "No resources found."
         else:
-            header = lines[0].split(',')
-            rows = [line.split(',') for line in lines[1:]]
-            markdown_table = f"| {' | '.join(header)} |\n|{'|'.join(['---'] * len(header))}|\n"
-            for row in rows:
-                markdown_table += f"| {' | '.join(row)} |\n"
-            final_response = markdown_table
+            import csv
+            from io import StringIO
+            
+            # Use proper CSV parsing
+            csv_data = StringIO(k8s_result.get("raw", ""))
+            reader = csv.reader(csv_data)
+            rows = list(reader)
+            
+            if rows:
+                header = [html.escape(cell) for cell in rows[0]]
+                table_rows = []
+                for row in rows[1:]:
+                    escaped_row = [html.escape(cell) for cell in row]
+                    table_rows.append(f"| {' | '.join(escaped_row)} |")
+                
+                markdown_table = f"| {' | '.join(header)} |\n|{'|'.join(['---'] * len(header))}|\n"
+                markdown_table += "\n".join(table_rows)
+                final_response = markdown_table
+            else:
+                final_response = "No resources found."
     else:
-        # For logs, wrap in markdown code block
+        # For logs, wrap in markdown code block with escaping
         raw_result = k8s_result.get("raw", "No result found.")
         if intent["action"] == "get_logs":
-            final_response = f"```\n{raw_result}\n```"
+            final_response = f"```\n{html.escape(raw_result)}\n```"
         else:
-            final_response = raw_result
+            final_response = html.escape(raw_result)
 
     return {"final_response": final_response}
 
@@ -262,27 +310,30 @@ app_graph = workflow.compile()
 
 # --- API Endpoints (Updated for Session Management) ---
 @app.post("/chat")
-async def chat(request: Request, chat_request: ChatRequest):
+async def chat(request: Request, chat_request: ChatRequest, x_session_id: Optional[str] = Header(None)):
     if not llm:
         raise HTTPException(status_code=500, detail="LLM not configured.")
 
-    # Use client IP as a simple session identifier
-    session_id = request.client.host
+    # Use session header or generate UUID-based session ID
+    session_id = x_session_id or str(uuid.uuid4())
     
     # Retrieve history from cache or start a new one
     chat_history = session_cache.get(session_id, [])
     
-    inputs = {"user_message": chat_request.message, "chat_history": chat_history}
+    # Sanitize user input
+    sanitized_message = html.escape(chat_request.message.strip())
+    
+    inputs = {"user_message": sanitized_message, "chat_history": chat_history}
     
     try:
         result = app_graph.invoke(inputs)
         final_response = result["final_response"]
         
         # Update history and save back to cache
-        updated_history = chat_history + [HumanMessage(content=chat_request.message), AIMessage(content=final_response)]
+        updated_history = chat_history + [HumanMessage(content=sanitized_message), AIMessage(content=final_response)]
         session_cache[session_id] = updated_history
         
-        return {"reply": final_response}
+        return {"reply": final_response, "session_id": session_id}
     except Exception as e:
         logger.error(f"Error during graph execution: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")

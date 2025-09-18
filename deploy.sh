@@ -28,20 +28,20 @@ fi
 echo "✅ Credentials found."
 
 # --- Step 3: Create/Update Kubernetes Secret ---
-echo "🔐 Creating/updating Kubernetes secret 'bedrock-credentials' நான..."
+echo "🔐 Creating/updating Kubernetes secret 'bedrock-credentials'..."
 
 # This command is idempotent. It creates the secret if it doesn't exist, and updates it if it does.
 kubectl create secret generic bedrock-credentials \
   --from-literal=aws_access_key_id="${AWS_ACCESS_KEY_ID}" \
   --from-literal=aws_secret_access_key="${AWS_SECRET_ACCESS_KEY}" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --dry-run=client -o yaml | kubectl apply -f - || { echo "Failed to create/update secret"; exit 1; }
 
 echo "✅ Secret 'bedrock-credentials' is up to date."
 
 # --- Step 4: Apply all Kubernetes manifests ---
 echo "Applying all Kubernetes manifests from the 'k8s' directory..."
 
-kubectl apply -f k8s/
+kubectl apply -f k8s/ || { echo "Failed to apply Kubernetes manifests"; exit 1; }
 
 echo "✅ All manifests applied."
 

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-k8s-config
+  namespace: default
+data:
+  aws_region: "us-east-1"

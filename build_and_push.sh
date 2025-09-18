@@ -37,15 +37,15 @@ echo
 echo "Building image: ${FULL_IMAGE_NAME}"
 echo
 
-docker build -t "${FULL_IMAGE_NAME}" .
+docker build -t "${FULL_IMAGE_NAME}" . || { echo "Docker build failed"; exit 1; }
 
 echo
 echo "Logging into Docker Hub..."
-docker login
+docker login || { echo "Docker login failed"; exit 1; }
 
 echo
 echo "Pushing image to Docker Hub..."
-docker push "${FULL_IMAGE_NAME}"
+docker push "${FULL_IMAGE_NAME}" || { echo "Docker push failed"; exit 1; }
 
 echo
 echo "--- Success! ---"

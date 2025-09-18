@@ -137,9 +137,16 @@
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
+        let sessionId = localStorage.getItem('sessionId') || null;
+
         async function sendMessage() {
             const message = messageInput.value.trim();
-            if (!message) return;
+            if (!message || message.length > 1000) {
+                if (message.length > 1000) {
+                    appendMessage('bot', 'Message too long. Please keep it under 1000 characters.');
+                }
+                return;
+            }
 
             appendMessage('user', message);
             messageInput.value = '';
@@ -148,9 +155,14 @@
             chatContainer.scrollTop = chatContainer.scrollHeight;
 
             try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (sessionId) {
+                    headers['X-Session-ID'] = sessionId;
+                }
+
                 const response = await fetch('/chat', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: headers,
                     body: JSON.stringify({ message: message })
                 });
 
@@ -160,6 +172,10 @@
                 }
 
                 const data = await response.json();
+                if (data.session_id && !sessionId) {
+                    sessionId = data.session_id;
+                    localStorage.setItem('sessionId', sessionId);
+                }
                 appendMessage('bot', data.reply);
 
             } catch (error) {
