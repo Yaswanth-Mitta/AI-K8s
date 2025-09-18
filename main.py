@@ -104,7 +104,7 @@ def nlu_agent(state: GraphState):
                 '''You are an expert at converting natural language to a JSON intent for a Kubernetes chat bot.
                 Use the conversation history to understand context and resolve references.
                 Your output must be a single, valid JSON object.
-                Valid actions are: "get_pods", "get_services", "get_logs", "scale", "diagnose_pod".
+                Valid actions are: "get_pods", "get_services", "get_logs", "scale", "diagnose_pod", "get_pod_details".
 
                 --- CONVERSATION HISTORY ---
                 {chat_history}
@@ -114,11 +114,14 @@ def nlu_agent(state: GraphState):
                 User: "list all services" -> {{ "action": "get_services" }}
                 User: "scale frontend to 3 replicas" -> {{ "action": "scale", "resource": "deployment", "name": "frontend", "replicas": 3 }}
                 User: "get logs for backend-abc" -> {{ "action": "get_logs", "pod": "backend-abc" }}
+                User: "describe pod backend-abc" -> {{ "action": "get_pod_details", "pod": "backend-abc" }}
+                User: "describe ai-k8s pod" -> {{ "action": "get_pod_details", "pod": "ai-k8s-chat-deployment" }}
                 
                 --- CONTEXTUAL EXAMPLES ---
                 (History shows a pod named 'backend-xyz-123' is in CrashLoopBackOff)
                 User: "why is that one failing?" -> {{ "action": "diagnose_pod", "pod": "backend-xyz-123" }}
                 User: "get logs for that pod" -> {{ "action": "get_logs", "pod": "backend-xyz-123" }}
+                User: "describe this pod ai-k8s-chat-deployment-544fc7d5b6-x2g8z" -> {{ "action": "get_pod_details", "pod": "ai-k8s-chat-deployment-544fc7d5b6-x2g8z" }}
                 '''
             ),
             ("human", "{user_message}"),
@@ -150,7 +153,7 @@ def validator_agent(state: GraphState):
     intent = state.get("intent", {})
     action = intent.get("action")
     
-    if not action or action not in ["get_pods", "get_services", "get_logs", "scale", "diagnose_pod"]:
+    if not action or action not in ["get_pods", "get_services", "get_logs", "scale", "diagnose_pod", "get_pod_details"]:
         intent["action"] = "error"
         intent["details"] = "Invalid action specified."
     
@@ -161,9 +164,9 @@ def validator_agent(state: GraphState):
     elif action == "scale" and (not intent.get("name") or not intent.get("replicas")):
         intent["action"] = "error"
         intent["details"] = "Deployment name and replica count are required for scaling."
-    elif action == "diagnose_pod" and not intent.get("pod"):
+    elif action in ["diagnose_pod", "get_pod_details"] and not intent.get("pod"):
         intent["action"] = "error"
-        intent["details"] = "Pod name is required for diagnosis."
+        intent["details"] = "Pod name is required for this operation."
     
     return {"intent": intent}
 
@@ -208,6 +211,40 @@ def k8s_executor(state: GraphState):
             else:
                 k8s_apps_v1.patch_namespaced_deployment_scale(name=intent["name"], namespace="default", body={"spec": {"replicas": intent["replicas"]}})
                 result["raw"] = f"Deployment {intent['name']} scaled to {intent['replicas']} replicas."
+
+        elif action == "get_pod_details":
+            if "pod" not in intent:
+                result["raw"] = "Error: Pod name is required."
+            else:
+                pod_name = intent["pod"]
+                # Find pod by partial name match
+                pods = k8s_core_v1.list_namespaced_pod(namespace="default")
+                matching_pod = None
+                for pod in pods.items:
+                    if pod_name.lower() in pod.metadata.name.lower():
+                        matching_pod = pod
+                        break
+                
+                if matching_pod:
+                    pod_info = matching_pod
+                    status = pod_info.status.phase
+                    ready = "True" if pod_info.status.conditions and any(c.type == "Ready" and c.status == "True" for c in pod_info.status.conditions) else "False"
+                    restarts = sum([c.restart_count for c in pod_info.status.container_statuses]) if pod_info.status.container_statuses else 0
+                    age = get_relative_age(pod_info.status.start_time)
+                    node = pod_info.spec.node_name or "N/A"
+                    ip = pod_info.status.pod_ip or "N/A"
+                    
+                    details = f"""Pod Details for {pod_info.metadata.name}:
+- Status: {status}
+- Ready: {ready}
+- Restarts: {restarts}
+- Age: {age}
+- Node: {node}
+- IP: {ip}
+- Image: {pod_info.spec.containers[0].image if pod_info.spec.containers else 'N/A'}"""
+                    result["raw"] = details
+                else:
+                    result["raw"] = f"Pod matching '{pod_name}' not found."
 
         elif action == "diagnose_pod":
             if "pod" not in intent:
