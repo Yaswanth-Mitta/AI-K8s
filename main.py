@@ -408,7 +408,7 @@ Based on the output, provide:
 2. Whether more commands are needed
 3. If needed, suggest the next action
 
-Output JSON: {"analysis": "your analysis", "needs_more": true/false, "next_suggestion": "suggested action"}'''),
+Output JSON: {{"analysis": "your analysis", "needs_more": true/false, "next_suggestion": "suggested action"}}'''),
         ("human", "Current output:\n{output}\n\nUser's original request: {user_message}")
     ])
     
