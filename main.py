@@ -142,7 +142,7 @@ def nlu_agent(state: GraphState):
             raise ValueError("No JSON found in response")
     except (json.JSONDecodeError, ValueError) as e:
         logger.error(f"Error decoding LLM response into JSON: {e}")
-        return {"intent": {"action": "error", "details": "I couldn't understand that request."}}}
+        return {"intent": {"action": "error", "details": "I couldn't understand that request."}}
 
 def validator_agent(state: GraphState):
     """Validates the intent from the NLU agent."""
