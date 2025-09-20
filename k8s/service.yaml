@@ -4,7 +4,7 @@ metadata:
   name: ai-k8s-chat-service
   namespace: default
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: ai-k8s-chat
   ports:
