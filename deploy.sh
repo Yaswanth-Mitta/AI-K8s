@@ -5,6 +5,17 @@ set -e
 
 echo "🚀 Starting deployment process..."
 
+# --- Step 0: Install NGINX Ingress Controller if not present ---
+echo "🔎 Checking NGINX Ingress Controller..."
+if ! kubectl get pods -n ingress-nginx | grep -q "ingress-nginx-controller.*Running"; then
+    echo "📦 Installing NGINX Ingress Controller..."
+    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/baremetal/deploy.yaml
+    echo "⏳ Waiting for ingress controller to be ready..."
+    kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=300s
+else
+    echo "✅ NGINX Ingress Controller already running."
+fi
+
 # --- Step 1: Check for and load .env file ---
 echo "🔎 Checking for .env file..."
 if [ ! -f .env ]; then
@@ -65,7 +76,9 @@ echo ""
 echo "To check the status of your application, run:"
 echo "  kubectl get pods -l app=ai-k8s-chat"
 
-echo "To access the UI via ingress:"
-echo "  kubectl get ingress ai-k8s-chat-ingress"
-echo "  # Access directly via: http://<EC2_PUBLIC_IP>"
-echo "  # Make sure EC2 security group allows port 80 (HTTP)"
+echo "To access the UI:"
+echo "  # Get NodePort for ingress controller:"
+echo "  kubectl get svc -n ingress-nginx ingress-nginx-controller"
+echo "  # Access via: http://<EC2_PUBLIC_IP>:<NODEPORT>"
+echo "  # Current NodePort should be: 31687"
+echo "  # Make sure EC2 security group allows the NodePort (31687)"
